@@ -42,13 +42,15 @@ TOK_COLON_COLON = Token('::', "::")
 TOK_SEMI = Token(';', ";")
 TOK_EQ = Token('=', "=")
 
-class ParseError(object):
-	def __init__(self, text, offset):
+class ParseError(Exception):
+	def __init__(self, text, file_name, offset):
+		self.file_name = file_name
 		self.text = text
 		self.offset = offset
 		
 class Tokenizer(object):
-	def __init__(self, text):
+	def __init__(self, file_name, text):
+		self.file_name = file_name
 		self.text = text
 		self.position = 0
 		self.tok = TOK_START
@@ -84,8 +86,8 @@ class Tokenizer(object):
 				self.tok = TOK_SEMI
 			elif equals(','):
 				self.tok = TOK_COMMA
-			elif equals('"'):
-				end = self.find_string_end()
+			elif equals('"') or equals("'"):
+				end = self.find_string_end(self.text[self.position])
 				self.tok = Token('STRING', self.text[start:end])
 			elif equals('/*'):
 				self.position = self.find_comment_end()
@@ -115,7 +117,7 @@ class Tokenizer(object):
 				return position + 2
 			else:
 				position += 1
-		raise ParseError("Unterminated comment", self.position)
+		raise ParseError("Unterminated comment", self.file_name, self.position)
 		
 	def find_next_line(self):
 		text = self.text
@@ -128,18 +130,18 @@ class Tokenizer(object):
 				position += 1
 		return position
 
-	def find_string_end(self):
+	def find_string_end(self, kind):
 		text = self.text
 		position = self.position + 1
 		max_position = len(text)
 		while position < max_position:
-			if text[position] == '"':
+			if text[position] == kind:
 				return position + 1
 			elif text[position] == '\\':
 				position += 2
 			else:
 				position += 1
-		raise ParseError("Unterminated string", self.position)
+		raise ParseError("Unterminated string", self.file_name, self.position)
 		
 	def find_identifier_end(self):
 		text = self.text
@@ -155,42 +157,41 @@ class Tokenizer(object):
 		
 	def assertion_contents(self):
 		assert self.tok == TOK_LPAREN
+		start_position = self.position
 		counter = 1
-		text = self.text
-		position = start_position = self.position
-		max_position = len(text)
 		contents = []
-		while position < max_position:
-			ch = text[position]
-			if ch == '(':
-				counter += 1
-			elif ch == ')' and counter > 1:
+		while self.next_token() != TOK_EOF:
+			if self.tok == TOK_RPAREN and counter > 1:
 				counter -= 1
-			elif ch == ')':
-				self.position = position + 1
-				self.tok = TOK_RPAREN
-				contents += [text[start_position:position].strip()]
+			elif self.tok == TOK_RPAREN:
+				end_position = self.position - len(self.tok.text)
+				contents += [self.text[start_position:end_position].strip()]
 				return contents
-			elif ch == ',' and counter == 1:
-				contents += [text[start_position:position].strip()]
-				start_position = position + 1
-			position += 1
-		raise ParseError("Unclosed parenthesis", start_position)
+			elif self.tok == TOK_LPAREN:
+				counter += 1
+			elif self.tok == TOK_COMMA and counter == 1:
+				end_position = self.position - len(self.tok.text)
+				contents += [self.text[start_position:end_position].strip()]
+				start_position = self.position + 1
+		raise ParseError("Unclosed parenthesis", self.file_name, start_position)
 		
 # __________________________________________________________________
 # Assertion Gatherer
 
 class Assertion(object):
 	def __init__(self, contents, file_name, offset, prelude, stmts):
-		self.contents = contents
+		self.expr = contents[0]
 		self.file_name = file_name
 		self.offset = offset
 		self.prelude = prelude
 		self.stmts = stmts
 		
+	def is_null_check(self):
+		return re.match("^\w+$", self.expr) is not None
+		
 	def __repr__(self):
 		return "Assertion(%r, %r, %r, %r, %r)" % (
-			self.contents, self.file_name, self.offset, self.prelude, self.stmts)
+			self.expr, self.file_name, self.offset, self.prelude, self.stmts)
 
 # Start in state OUTER.
 #
@@ -206,7 +207,7 @@ class Assertion(object):
 
 class Gather(object):
 	def __init__(self, file_name, text):
-		self.tokenizer = Tokenizer(text)
+		self.tokenizer = Tokenizer(file_name, text)
 		self.file_name = file_name
 		self.assertions = []
 	
@@ -215,9 +216,17 @@ class Gather(object):
 			tok = self.tokenizer.next_token()
 			if tok.is_id("class"):
 				self.class_header()
+			#elif tok.is_id("namespace"):
+			#	self.namespace_header()
 			elif tok == TOK_LBRACE:
 				self.function_body()
 		return self.assertions
+		
+	def namespace_header(self):
+		while self.tokenizer.tok != TOK_EOF:
+			tok = self.tokenizer.next_token()
+			if tok == TOK_SEMI or tok == TOK_LBRACE:
+				return
 		
 	def class_header(self):
 		while self.tokenizer.tok != TOK_EOF:
@@ -261,13 +270,43 @@ class Gather(object):
 						offset, prelude, statements)
 					self.assertions.append(assertion)
 					
+# __________________________________________________________________
+# Summarize
+
+def summarize(assertions):
+	in_prelude = [a for a in assertions if a.prelude]
+	null_in_prelude = [a for a in in_prelude if a.is_null_check()]
+	in_body = [a for a in assertions if not a.prelude]
+	null_in_body = [a for a in in_body if a.is_null_check()]
+	
+	la = float(len(assertions))
+	lp = float(len(in_prelude))
+	lnp = float(len(null_in_prelude))
+	lb = float(len(in_body))
+	lnb = float(len(null_in_body))
+	
+	print "Total assertions: %.0f" % la
+	print "In prelude: %.0f (%3.0f%%)" % (
+		lp, 100.0 * lp / la)
+	print "      null: %.0f (%3.0f%% / %3.0f%%)" % (
+		lnp, 100.0 * lnp / la, 100.0 * lnp / lp)
+	print "In body:    %.0f (%3.0f%%)" % (
+		lb, 100.0 * lb / la)
+	print "      null: %.0f (%3.0f%% / %3.0f%%)" % (
+		lnb, 100.0 * lnb / la, 100.0 * lnb / lb)
+					
 def main(args):
 	assertions = []
 	for file_name in args:
 		text = open(file_name).read()
-		a = Gather(file_name, text).outer()
-		assertions += a
+		try:
+			a = Gather(file_name, text).outer()
+			assertions += a
+		except ParseError, e:
+			line_num = text[:e.offset].count("\n")+1
+			print "%s:%d: %s" % (file_name, line_num, e.text)
 	for a in assertions:
 		print repr(a)
+	summarize(assertions)
 		
 main(sys.argv[1:])
